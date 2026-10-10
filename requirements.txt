@@ -1,0 +1,3 @@
+numpy
+git+https://github.com/Ghosteined/rtg_api_py.git
+git+https://github.com/Ghosteined/rbxm_parser.git
