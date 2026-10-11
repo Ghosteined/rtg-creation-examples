@@ -238,6 +238,24 @@ class Seq:
     def latch(self, set_: Node, reset: Node) -> Node:
         return self.latch_close(self.latch_open(), set_, reset)
 
+    def ninit(self) -> Node:
+        """Off until INIT has been pressed and released, then on (shared by every gated latch)."""
+        if not hasattr(self, "_ninit"):
+            self._ninit = self.c.NOT(self.c._add("OR", (self.init,)))
+        return self._ninit
+
+    def dlatch(self, q: Node, d: Node, en: Node) -> Node:
+        """Gated D latch on the output gate `q` (from latch_open): follows `d` while `en` is high, holds
+        otherwise; INIT clears it.  Q = OR(AND(d, en), AND(Q, nr)) with nr = AND(OR(d, NOT en), ninit):
+        the hold term stays on whenever d is 1, so closing the window cannot glitch the latch, and only the
+        true rail of `d` is needed (5 gates instead of 6 + a false rail)."""
+        c = self.c
+        nen = c.NOT(c.OR(en, self.init))
+        nr = c.AND(c.OR(d, nen), self.ninit())
+        q.ins = (c.AND(d, en), c.AND(q, nr))
+        c.latches.add(q.id)
+        return q
+
     # -- clock ---------------------------------------------------------------
     def clock(self) -> Clock:
         """Free-running clock, period 4*tau: a NOT + two Delayers in a ring.
