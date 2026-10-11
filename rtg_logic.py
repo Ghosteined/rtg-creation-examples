@@ -117,6 +117,27 @@ class Logic:
             borrow = self.and_(self.not_(b), borrow)
         return out
 
+    def step(self, w, move, up):
+        """w +1 (up) / -1 (not up) when `move`, else w.  Toggle form: bit i flips when `move` and every lower
+        bit is 1 (counting up) or 0 (counting down): far fewer gates than inc + dec + two muxes."""
+        out, ones, zeros = [], self.ONE, self.ONE
+        for b in w:
+            flip = self.and_(move, self.mux(up, zeros, ones))
+            out.append(self.xor(b, flip))
+            ones, zeros = self.and_(b, ones), self.and_(self.not_(b), zeros)
+        return out
+
+    def override(self, w, cases):
+        """w, except that when a condition of `cases` [(cond, int value)] is true the word becomes that value
+        (conditions must be mutually exclusive).  Constant values fold into plain AND / OR gates."""
+        m = self.any_([c for c, _ in cases])
+        out = []
+        for i, b in enumerate(w):
+            ones = [c for c, v in cases if (v >> i) & 1]
+            keep = self.and_(b, self.not_(m))
+            out.append(self.or_(keep, self.any_(ones)) if ones else keep)
+        return out
+
     def add_w(self, a, b):
         out, carry = [], self.ZERO
         for x, y in zip(a, b):
@@ -150,10 +171,9 @@ class Reg:
         slave_window = m.clk.slave if (self.free or m._slave_en is None) else m._slave_en
         for i, (s, inv) in enumerate(zip(self._slaves, self._inv)):
             d = L.not_(nxt[i]) if inv else nxt[i]
-            assert isinstance(d.t, Node) and isinstance(d.f, Node), "register input is constant"
-            mq = m.seq.latch(c.AND(d.t, m.clk.master), c.AND(d.f, m.clk.master))      # master: open in window 3
-            M = D(mq, c.NOT(c.OR(mq, m.init)))
-            m.seq.latch_close(s, c.AND(M.t, slave_window), c.AND(M.f, slave_window))    # slave: open in window 1
+            assert isinstance(d.t, Node), "register input is constant"
+            mq = m.seq.dlatch(m.seq.latch_open(), d.t, m.clk.master)          # master: open in window 3
+            m.seq.dlatch(s, mq, slave_window)                                 # slave: open in window 1
 
 
 class Machine:
@@ -164,7 +184,21 @@ class Machine:
         self.seq = Seq(self.c, self.init, tau)
         self.tau, self.pulse_w = tau, (pulse if pulse is not None else tau / 3)
         self.clk = self.seq.clock()
-        self.regs, self._pulse, self._slave_en = [], None, None
+        self.regs, self._pulse, self._clr, self._slave_en = [], None, None, None
+        self.marks = []
+
+    def mark(self, name):
+        """Profiling: remember how many nodes exist now (call between sections of the project script).
+        m.marks_report() then prints how many nodes (about 1 gate each, before unused ones are pruned)
+        every section added."""
+        self.marks.append((name, len(self.c.nodes)))
+
+    def marks_report(self):
+        rows, prev = [], 0
+        for name, n in self.marks + [("(end)", len(self.c.nodes))]:
+            rows.append(f"{name:<24}{n - prev:>6}")
+            prev = n
+        return "\n".join(rows)
 
     def run_when(self, bit):
         """The game state only advances in ticks where `bit` is true (pause otherwise).  Done by gating the
@@ -172,7 +206,7 @@ class Machine:
         .set() of the registers it should gate; registers made with free=True are not gated."""
         assert self._slave_en is None, "run_when called twice"
         c = self.c
-        mq = self.seq.latch(c.AND(bit.t, self.clk.master), c.AND(bit.f, self.clk.master))
+        mq = self.seq.dlatch(self.seq.latch_open(), bit.t, self.clk.master)
         self._slave_en = c.AND(mq, self.clk.slave)
 
     def reg(self, width, init=0, free=False):
@@ -181,35 +215,46 @@ class Machine:
         return r
 
     def key(self, label, tap=True):
-        """A key (Button on a labelled sensor) as 'wants to move at this clock tick': true when the key is
-        held down at the tick, or (tap=True) when it was pressed at any moment since the previous tick,
-        so even a quick tap is never lost.  The result is stable for the whole tick."""
-        c, L = self.c, self.L
-        if self._pulse is None:
-            # a short pulse shortly after each cycle starts (inside the slave window, far from the master
-            # window that closes at the cycle start): keys can only change state there, never during a latch
-            # window edge
-            d1 = self.clk.d1
-            self._pulse = c.AND(d1, c.NOT(c.OR(c.delay(d1, self.pulse_w), self.init)))
+        """A keyboard key (Button on a labelled sensor) as 'wants to move at this clock tick': true when the
+        key is down at the tick or (tap=True) when it was pressed at any moment since the previous tick, so
+        even a quick tap is never lost.  The result is stable for the whole tick."""
+        c = self.c
         btn = c.button(label)
+        return self._sample(btn, tap)
 
-        def parity_change(toggle):
-            """bit that is true in the tick in which `toggle` flipped (it only ever flips near the pulse)"""
-            td = D(toggle, c.NOT(c.OR(toggle, self.init)))
-            prev = self.reg(1, free=True)
-            prev.set([td])
-            return L.xor(td, prev.q[0])
+    def switch(self, label):
+        """A non-keyboard control (a Switch on a labelled sensor): it keeps its state until flipped.
+        Use it for things like RUN, never for real keyboard keys (those are Buttons: m.key).
+        Returns a bit that is stable for the whole tick."""
+        return self._sample(self.c.switch(label), tap=False)
 
-        held = c.toggle(c.AND(btn, self._pulse))              # flips once per tick in which the key is down
-        want = parity_change(held)
+    def _windows(self):
+        """Two short windows after the start of each cycle, inside the slave window and far from the master
+        window: `pulse` (sample the inputs) and right after it `clr` (forget the presses just sampled)."""
+        if self._pulse is None:
+            c, d1 = self.c, self.clk.d1
+            d1w = c.delay(d1, self.pulse_w)
+            d1ww = c.delay(d1w, self.pulse_w)
+            self._pulse = c.AND(d1, c.NOT(c.OR(d1w, self.init)))
+            self._clr = c.AND(d1w, c.NOT(c.OR(d1ww, self.init)))
+        return self._pulse, self._clr
+
+    def _sample(self, src, tap):
+        """Input -> one bit that only changes at the pulse (a latch that samples `src` then).
+        tap: a press edge (src rising) also sets a 'pressed' latch that stays until the pulse has read it."""
+        c, ini = self.c, self.init
+        pulse, clr = self._windows()
+        w = src
         if tap:
-            press = c.toggle(btn)                              # flips at every press, at any moment
-            seen_buf = c._add("OR", ())
-            seen = c._add("toggle", (seen_buf,))               # copies `press` at the pulse (so it only flips there)
-            pd, sd = D(press, c.NOT(c.OR(press, self.init))), D(seen, c.NOT(c.OR(seen, self.init)))
-            seen_buf.ins = (c.AND(self._pulse, L.xor(pd, sd).t),)
-            want = L.or_(want, parity_change(seen))
-        return want
+            late = c.delay(src, self.pulse_w)                   # the edge pulse is as long as the pulse window
+            edge = c.AND(src, c.NOT(c.OR(late, ini)))
+            pressed = self.seq.latch(edge, clr)
+            w = c.OR(src, pressed)
+        # (dual-rail set / reset latch on purpose: `w` changes right after the pulse when `pressed` is cleared,
+        #  which a gated D latch would not survive)
+        wf = c.NOT(c.OR(w, ini))
+        q = self.seq.latch(c.AND(pulse, w), c.AND(pulse, wf))
+        return D(q, c.NOT(c.OR(q, ini)))
 
     def output(self, label, bit):
         assert isinstance(bit.t, Node), "output is constant"

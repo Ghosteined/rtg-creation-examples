@@ -9,6 +9,8 @@ def run(machine, outfile, layout=None):
     open(outfile, "w").write(res.code + "\n")
     print(f"logic depth {machine.depth()} gates, tau {machine.tau} -> one tick = {4 * machine.tau:g} s")
     print(res.report())
+    if getattr(machine, "marks", None):
+        print("nodes added per section (before pruning):\n" + machine.marks_report())
     from rtg_sim import load, structural_checks
     structural_checks(load(outfile))
     print(f"written to {outfile}; structure OK (one rigid assembly, one ball per cup, gate inputs driven)")
